@@ -428,6 +428,20 @@ TEST_F(TcpLocalMemcpyAutoEnableTest,
     EXPECT_EQ(sink.strategy(), "TRANSFER_ENGINE");
 }
 
+TEST_F(TcpLocalMemcpyAutoEnableTest, MetadataRpcMetaRepublishIsIdempotent) {
+    EnvGuard legacy_rpc_binding_guard("MC_LEGACY_RPC_PORT_BINDING");
+    setenv("MC_LEGACY_RPC_PORT_BINDING", "1", 1);
+
+    const std::string server_name = "127.0.0.1:18003";
+    TransferEngine engine;
+    ASSERT_EQ(engine.init(metadata_url_, server_name, "127.0.0.1", 18003),
+              0);
+
+    auto metadata = engine.getMetadata();
+    ASSERT_NE(metadata, nullptr);
+    EXPECT_EQ(metadata->rePublishRpcMetaEntry(server_name), 0);
+}
+
 class HotCacheRedirectStrategyTest
     : public TcpLocalMemcpyAutoEnableTest,
       public ::testing::WithParamInterface<HandshakeMode> {};

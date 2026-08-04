@@ -1188,10 +1188,14 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
 
     Json::Value existing;
     if (storage_plugin_->get(full_key, existing)) {
-        Json::Value desired;
-        desired["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
-        desired["rpc_port"] = static_cast<Json::UInt>(local_rpc_meta_.rpc_port);
-        if (existing == desired) {
+        const Json::Value& existing_host = existing["ip_or_host_name"];
+        const Json::Value& existing_port = existing["rpc_port"];
+        const bool matching_port =
+            (existing_port.isUInt() ||
+             (existing_port.isInt() && existing_port.asInt() >= 0)) &&
+            existing_port.asUInt() == local_rpc_meta_.rpc_port;
+        if (existing.isObject() && existing_host.isString() && matching_port &&
+            existing_host.asString() == local_rpc_meta_.ip_or_host_name) {
             return 0;
         }
     }
