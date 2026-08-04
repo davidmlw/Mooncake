@@ -277,8 +277,30 @@ impl MooncakeStore {
     pub fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let size = self.get_size(key)?;
         let mut buf = vec![0u8; size as usize];
-        let written =
-            unsafe { self.get_into(key, buf.as_mut_ptr() as *mut c_void, buf.len())? };
+
+        if buf.is_empty() {
+            return Ok(buf);
+        }
+
+        let buffer = buf.as_mut_ptr() as *mut c_void;
+        // RDMA transports require the destination to remain registered while
+        // the read is in flight; the safe Vec-returning API owns that lifecycle.
+        unsafe { self.register_buffer(buffer, buf.len())? };
+        let result = unsafe { self.get_into(key, buffer, buf.len()) };
+        let unregister = unsafe { self.unregister_buffer(buffer) };
+        let written = match (result, unregister) {
+            (Ok(written), Ok(())) => written,
+            (Err(error), Ok(())) => return Err(error),
+            (result, Err(unregister_error)) => {
+                // Keep the allocation alive if the native registration could
+                // still refer to it; leaking is safer than a dangling pointer.
+                std::mem::forget(buf);
+                return match result {
+                    Ok(_) => Err(unregister_error),
+                    Err(error) => Err(error),
+                };
+            }
+        };
         buf.truncate(written as usize);
         Ok(buf)
     }
