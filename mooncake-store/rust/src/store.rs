@@ -273,12 +273,25 @@ impl MooncakeStore {
 
     /// Retrieve the value for `key` into a Rust-owned `Vec<u8>`.
     ///
-    /// The buffer is allocated to the exact size of the stored value.
+    /// The buffer is allocated to the exact size of the stored value. For an
+    /// RDMA-backed store, it is registered for the duration of the read so
+    /// callers of this safe convenience method do not need to manage a
+    /// zero-copy buffer themselves.
     pub fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let size = self.get_size(key)?;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
         let mut buf = vec![0u8; size as usize];
-        let written =
-            unsafe { self.get_into(key, buf.as_mut_ptr() as *mut c_void, buf.len())? };
+        let buffer = buf.as_mut_ptr() as *mut c_void;
+        unsafe { self.register_buffer(buffer, buf.len())? };
+        let read = unsafe { self.get_into(key, buffer, buf.len()) };
+        let unregister = unsafe { self.unregister_buffer(buffer) };
+        let written = match (read, unregister) {
+            (Ok(written), Ok(())) => written,
+            (Err(error), _) => return Err(error),
+            (Ok(_), Err(error)) => return Err(error),
+        };
         buf.truncate(written as usize);
         Ok(buf)
     }
