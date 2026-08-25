@@ -274,6 +274,8 @@ impl MooncakeStore {
     /// # Safety
     ///
     /// `buffer` must point to at least `size` bytes of writable, valid memory.
+    /// For RDMA transports, the region must also be registered with
+    /// [`MooncakeStore::register_buffer`] until this operation returns.
     pub unsafe fn get_into(
         &self,
         key: &str,
@@ -290,11 +292,25 @@ impl MooncakeStore {
 
     /// Retrieve the value for `key` into a Rust-owned `Vec<u8>`.
     ///
-    /// The buffer is allocated to the exact size of the stored value.
+    /// The buffer is allocated to the exact size of the stored value and is
+    /// registered for the duration of the transfer.  This keeps the copying
+    /// convenience API valid for both TCP and RDMA transports; callers that
+    /// reuse a long-lived registered region should prefer [`Self::get_into`].
     pub fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let size = self.get_size(key)?;
         let mut buf = vec![0u8; size as usize];
-        let written = unsafe { self.get_into(key, buf.as_mut_ptr() as *mut c_void, buf.len())? };
+        if buf.is_empty() {
+            return Ok(buf);
+        }
+        let pointer = buf.as_mut_ptr() as *mut c_void;
+        unsafe { self.register_buffer(pointer, buf.len())? };
+        let transfer = unsafe { self.get_into(key, pointer, buf.len()) };
+        let unregister = unsafe { self.unregister_buffer(pointer) };
+        let written = match (transfer, unregister) {
+            (Ok(written), Ok(())) => written,
+            (Err(error), _) => return Err(error),
+            (Ok(_), Err(error)) => return Err(error),
+        };
         buf.truncate(written as usize);
         Ok(buf)
     }
