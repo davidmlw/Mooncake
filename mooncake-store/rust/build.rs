@@ -327,10 +327,10 @@ fn main() {
     emit_link_searches(&search_dirs);
     emit_runtime_rpaths(&search_dirs);
 
-    // The Store, Transfer Engine, and common archives contain circular static
-    // references. Keep the complete CMake archive closure in a GNU ld rescan
-    // group so Cargo's native-library ordering cannot leave symbols unresolved.
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
+    // Native dependencies must be emitted as rustc-link-lib directives so they
+    // propagate when mooncake_store is linked into another Cargo package. Load
+    // each archive in full to make the circular Store/TE/common closure
+    // independent of the final linker's archive ordering.
     for library in [
         "mooncake_store",
         "mooncake_local_ssd",
@@ -339,9 +339,8 @@ fn main() {
         "base",
         "mooncake_common",
     ] {
-        println!("cargo:rustc-link-arg=-l{library}");
+        println!("cargo:rustc-link-lib=static:+whole-archive={library}");
     }
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
 
     if want_asan && (has_asan_runtime || has_library(&search_dirs, &["asan"])) {
         println!("cargo:rustc-link-lib=asan");
@@ -353,7 +352,7 @@ fn main() {
         "asio", "stdc++", "glog", "gflags", "pthread", "xxhash", "numa", "ibverbs", "jsoncpp",
         "yaml-cpp", "zstd", "m", "c",
     ] {
-        println!("cargo:rustc-link-arg=-l{library}");
+        println!("cargo:rustc-link-lib={library}");
     }
 
     for (link_name, candidates) in [
@@ -367,12 +366,12 @@ fn main() {
         ("zmq", &["zmq"]),
     ] {
         if has_library(&search_dirs, candidates) {
-            println!("cargo:rustc-link-arg=-l{link_name}");
+            println!("cargo:rustc-link-lib={link_name}");
         }
     }
 
     if has_gcov_runtime || has_library(&search_dirs, &["gcov"]) {
-        println!("cargo:rustc-link-arg=-lgcov");
+        println!("cargo:rustc-link-lib=gcov");
     }
 
     let include_dir =
