@@ -14,7 +14,7 @@ add_custom_command(
     CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
     MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
     # Directory containing libmooncake_store.a (or .so).
-    MOONCAKE_STORE_LIB_DIR=${CMAKE_CURRENT_BINARY_DIR}/../src
+    MOONCAKE_STORE_LIB_DIR=${PROJECT_BINARY_DIR}/mooncake-store/src
     # Directory containing store_c.h.
     MOONCAKE_STORE_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include cargo
     build --release
@@ -29,7 +29,7 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
     MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
-    MOONCAKE_STORE_LIB_DIR=${CMAKE_CURRENT_BINARY_DIR}/../src
+    MOONCAKE_STORE_LIB_DIR=${PROJECT_BINARY_DIR}/mooncake-store/src
     MOONCAKE_STORE_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include cargo
     build --examples --release
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -43,7 +43,7 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
     MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
-    MOONCAKE_STORE_LIB_DIR=${CMAKE_CURRENT_BINARY_DIR}/../src
+    MOONCAKE_STORE_LIB_DIR=${PROJECT_BINARY_DIR}/mooncake-store/src
     MOONCAKE_STORE_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include cargo test
     --tests --no-run --release
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

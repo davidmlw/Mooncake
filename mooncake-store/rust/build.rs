@@ -237,26 +237,6 @@ fn main() {
             .display()
     );
 
-    println!("cargo:rustc-link-lib=mooncake_store");
-
-    // Dependencies of mooncake_store that must be satisfied at link time.
-    // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
-    println!("cargo:rustc-link-lib=transfer_engine");
-    println!("cargo:rustc-link-lib=mooncake_common"); // Environ::Get() and other common utilities
-    println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
-    println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
-    println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency
-    println!("cargo:rustc-link-lib=cachelib_memory_allocator"); // static
-    println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-lib=glog");
-    println!("cargo:rustc-link-lib=gflags");
-    println!("cargo:rustc-link-lib=numa"); // NUMA binding
-    println!("cargo:rustc-link-lib=curl"); // HTTP metadata plugin
-    println!("cargo:rustc-link-lib=ibverbs"); // RDMA transport
-    println!("cargo:rustc-link-lib=yaml-cpp"); // tenant quota policy connector
-    println!("cargo:rustc-link-lib=pthread");
-    println!("cargo:rustc-link-lib=xxhash");
-
     // -----------------------------------------------------------------------
     // Header path for bindgen
     // -----------------------------------------------------------------------
@@ -275,9 +255,12 @@ fn main() {
         for dir in [
             build_dir.join("mooncake-store/src"),
             build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
+            build_dir.join("mooncake-store/src/local_ssd"),
             build_dir.join("mooncake-transfer-engine/src"),
             build_dir.join("mooncake-transfer-engine/src/common/base"),
             build_dir.join("mooncake-asio"),
+            build_dir.join("mooncake-common"),
+            build_dir.join("mooncake-common/src"),
             build_dir.join("mooncake-common/etcd"),
         ] {
             push_existing_dir(&mut search_dirs, dir);
@@ -289,10 +272,12 @@ fn main() {
     for dir in [
         default_build_dir.join("mooncake-store/src"),
         default_build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
+        default_build_dir.join("mooncake-store/src/local_ssd"),
         default_build_dir.join("mooncake-transfer-engine/src"),
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
         default_build_dir.join("mooncake-asio"),
         default_build_dir.join("mooncake-common"),
+        default_build_dir.join("mooncake-common/src"),
         default_build_dir.join("mooncake-common/etcd"),
         PathBuf::from("/usr/local/lib"),
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
@@ -342,29 +327,33 @@ fn main() {
     emit_link_searches(&search_dirs);
     emit_runtime_rpaths(&search_dirs);
 
+    // The Store, Transfer Engine, and common archives contain circular static
+    // references. Keep the complete CMake archive closure in a GNU ld rescan
+    // group so Cargo's native-library ordering cannot leave symbols unresolved.
+    println!("cargo:rustc-link-arg=-Wl,--start-group");
+    for library in [
+        "mooncake_store",
+        "mooncake_local_ssd",
+        "cachelib_memory_allocator",
+        "transfer_engine",
+        "base",
+        "mooncake_common",
+    ] {
+        println!("cargo:rustc-link-arg=-l{library}");
+    }
+    println!("cargo:rustc-link-arg=-Wl,--end-group");
+
     if want_asan && (has_asan_runtime || has_library(&search_dirs, &["asan"])) {
         println!("cargo:rustc-link-lib=asan");
     }
 
+    // Keep dynamic dependencies after the archive group. With --as-needed,
+    // placing them first drops libraries before archive objects reference them.
     for library in [
-        "mooncake_store",
-        "cachelib_memory_allocator",
-        "transfer_engine",
-        "base",
-        "asio",
-        "stdc++",
-        "glog",
-        "gflags",
-        "pthread",
-        "xxhash",
-        "numa",
-        "ibverbs",
-        "jsoncpp",
-        "yaml-cpp",
-        "zstd",
-        "m",
+        "asio", "stdc++", "glog", "gflags", "pthread", "xxhash", "numa", "ibverbs", "jsoncpp",
+        "yaml-cpp", "zstd", "m", "c",
     ] {
-        println!("cargo:rustc-link-lib={library}");
+        println!("cargo:rustc-link-arg=-l{library}");
     }
 
     for (link_name, candidates) in [
@@ -378,12 +367,12 @@ fn main() {
         ("zmq", &["zmq"]),
     ] {
         if has_library(&search_dirs, candidates) {
-            println!("cargo:rustc-link-lib={link_name}");
+            println!("cargo:rustc-link-arg=-l{link_name}");
         }
     }
 
     if has_gcov_runtime || has_library(&search_dirs, &["gcov"]) {
-        println!("cargo:rustc-link-lib=gcov");
+        println!("cargo:rustc-link-arg=-lgcov");
     }
 
     let include_dir =
