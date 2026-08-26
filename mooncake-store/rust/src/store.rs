@@ -290,13 +290,56 @@ impl MooncakeStore {
 
     /// Retrieve the value for `key` into a Rust-owned `Vec<u8>`.
     ///
-    /// The buffer is allocated to the exact size of the stored value.
+    /// The buffer is allocated to the exact size of the stored value and is
+    /// registered for the duration of the read so transports such as RDMA can
+    /// use it as a destination memory region.
     pub fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let size = self.get_size(key)?;
-        let mut buf = vec![0u8; size as usize];
-        let written = unsafe { self.get_into(key, buf.as_mut_ptr() as *mut c_void, buf.len())? };
-        buf.truncate(written as usize);
-        Ok(buf)
+        Self::read_registered_vec(
+            size as usize,
+            |buffer, len| unsafe { self.register_buffer(buffer, len) },
+            |buffer, len| unsafe { self.get_into(key, buffer, len) },
+            |buffer| unsafe { self.unregister_buffer(buffer) },
+        )
+    }
+
+    fn read_registered_vec<Register, Read, Unregister>(
+        size: usize,
+        register: Register,
+        read: Read,
+        unregister: Unregister,
+    ) -> Result<Vec<u8>, StoreError>
+    where
+        Register: FnOnce(*mut c_void, usize) -> Result<(), StoreError>,
+        Read: FnOnce(*mut c_void, usize) -> Result<i64, StoreError>,
+        Unregister: FnOnce(*mut c_void) -> Result<(), StoreError>,
+    {
+        let mut buffer = vec![0u8; size];
+        if buffer.is_empty() {
+            return Ok(buffer);
+        }
+
+        let pointer = buffer.as_mut_ptr() as *mut c_void;
+        register(pointer, buffer.len())?;
+
+        let read_result = read(pointer, buffer.len());
+        let unregister_result = unregister(pointer);
+        let written = match (read_result, unregister_result) {
+            (Ok(written), Ok(())) => written,
+            (Err(error), Ok(())) => return Err(error),
+            (read_result, Err(unregister_error)) => {
+                // The native transport may still hold this registration. Keep
+                // the allocation alive rather than leave a dangling pointer.
+                std::mem::forget(buffer);
+                return match read_result {
+                    Ok(_) => Err(unregister_error),
+                    Err(error) => Err(error),
+                };
+            }
+        };
+
+        buffer.truncate(written as usize);
+        Ok(buffer)
     }
 
     // -----------------------------------------------------------------------
@@ -620,6 +663,7 @@ impl Drop for MooncakeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::ffi::CStr;
 
     #[test]
@@ -704,6 +748,131 @@ mod tests {
         assert_eq!(cfg_ref.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);
         assert_eq!(ptrs.len(), 2);
+    }
+
+    #[test]
+    fn registered_vec_read_uses_one_registration_for_the_read() {
+        let calls = RefCell::new(Vec::new());
+        let registered_pointer = Cell::new(std::ptr::null_mut());
+
+        let value = MooncakeStore::read_registered_vec(
+            4,
+            |pointer, size| {
+                calls.borrow_mut().push("register");
+                registered_pointer.set(pointer);
+                assert_eq!(size, 4);
+                Ok(())
+            },
+            |pointer, size| {
+                calls.borrow_mut().push("read");
+                assert_eq!(pointer, registered_pointer.get());
+                assert_eq!(size, 4);
+                unsafe { std::ptr::copy_nonoverlapping(b"data".as_ptr(), pointer.cast(), 4) };
+                Ok(4)
+            },
+            |pointer| {
+                calls.borrow_mut().push("unregister");
+                assert_eq!(pointer, registered_pointer.get());
+                Ok(())
+            },
+        )
+        .expect("registered read should succeed");
+
+        assert_eq!(value, b"data");
+        assert_eq!(*calls.borrow(), ["register", "read", "unregister"]);
+    }
+
+    #[test]
+    fn registered_vec_read_skips_ffi_for_empty_value() {
+        let called = Cell::new(false);
+        let value = MooncakeStore::read_registered_vec(
+            0,
+            |_, _| {
+                called.set(true);
+                Ok(())
+            },
+            |_, _| {
+                called.set(true);
+                Ok(0)
+            },
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect("empty read should succeed");
+
+        assert!(value.is_empty());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn registered_vec_read_stops_when_registration_fails() {
+        let calls = RefCell::new(Vec::new());
+        let result = MooncakeStore::read_registered_vec(
+            4,
+            |_, _| {
+                calls.borrow_mut().push("register");
+                Err(StoreError::OperationFailed(-10))
+            },
+            |_, _| {
+                calls.borrow_mut().push("read");
+                Ok(4)
+            },
+            |_| {
+                calls.borrow_mut().push("unregister");
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(StoreError::OperationFailed(-10))));
+        assert_eq!(*calls.borrow(), ["register"]);
+    }
+
+    #[test]
+    fn registered_vec_read_unregisters_after_read_failure() {
+        let calls = RefCell::new(Vec::new());
+        let result = MooncakeStore::read_registered_vec(
+            4,
+            |_, _| {
+                calls.borrow_mut().push("register");
+                Ok(())
+            },
+            |_, _| {
+                calls.borrow_mut().push("read");
+                Err(StoreError::OperationFailed(-20))
+            },
+            |_| {
+                calls.borrow_mut().push("unregister");
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(StoreError::OperationFailed(-20))));
+        assert_eq!(*calls.borrow(), ["register", "read", "unregister"]);
+    }
+
+    #[test]
+    fn registered_vec_read_reports_unregister_failure() {
+        let calls = RefCell::new(Vec::new());
+        let result = MooncakeStore::read_registered_vec(
+            4,
+            |_, _| {
+                calls.borrow_mut().push("register");
+                Ok(())
+            },
+            |_, _| {
+                calls.borrow_mut().push("read");
+                Ok(4)
+            },
+            |_| {
+                calls.borrow_mut().push("unregister");
+                Err(StoreError::OperationFailed(-30))
+            },
+        );
+
+        assert!(matches!(result, Err(StoreError::OperationFailed(-30))));
+        assert_eq!(*calls.borrow(), ["register", "read", "unregister"]);
     }
 
     // -----------------------------------------------------------------------
