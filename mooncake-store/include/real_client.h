@@ -407,6 +407,12 @@ class RealClient : public PyClient {
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_hot_cache(
         const std::string &key);
 
+    // Load a key into the shared local hot cache once per owner process and
+    // acquire a reference to the published entry. The bool is true only for
+    // the caller that performed the owner-side load.
+    tl::expected<std::tuple<uint64_t, size_t, bool>, ErrorCode>
+    acquire_shared_hot_cache(const std::string &key, uint64_t timeout_ms);
+
     // Hot cache release: decrements ref_count after dummy is done reading.
     tl::expected<void, ErrorCode> release_hot_cache(const std::string &key);
 
@@ -1064,6 +1070,17 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    struct SharedHotCacheLoad {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        ErrorCode result = ErrorCode::INTERNAL_ERROR;
+    };
+
+    std::mutex shared_hot_cache_loads_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<SharedHotCacheLoad>>
+        shared_hot_cache_loads_;
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

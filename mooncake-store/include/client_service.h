@@ -703,6 +703,10 @@ class Client {
         return 0;
     }
 
+    uint8_t GetLocalHotCacheAdmissionThreshold() const {
+        return admission_threshold_;
+    }
+
     bool is_ping_healthy() const { return last_ping_success_.load(); }
 
     /**

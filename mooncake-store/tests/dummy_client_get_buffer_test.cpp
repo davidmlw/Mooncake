@@ -46,6 +46,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
+    server.register_handler<&RealClient::acquire_shared_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_release_hot_cache>(&rc);
@@ -111,11 +112,17 @@ class DummyClientGetBufferTest : public ::testing::Test {
         } else {
             unsetenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
         }
+        if (saved_hot_admission_env_.has_value()) {
+            setenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD",
+                   saved_hot_admission_env_->c_str(), 1);
+        } else {
+            unsetenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD");
+        }
     }
 
     // Bring up the full real+dummy stack.
     // Returns true on success.
-    bool SetupStack() {
+    bool SetupStack(bool shared_singleflight = false) {
         // Enable hot cache with production-scale block size
         const char *prev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
         if (prev) saved_hot_cache_env_ = std::string(prev);
@@ -131,6 +138,15 @@ class DummyClientGetBufferTest : public ::testing::Test {
         const char *prev_shm = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
         if (prev_shm) saved_hot_shm_env_ = std::string(prev_shm);
         setenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1", 1);
+
+        const char *prev_admission =
+            std::getenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD");
+        if (prev_admission) {
+            saved_hot_admission_env_ = std::string(prev_admission);
+        }
+        if (shared_singleflight) {
+            setenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1", 1);
+        }
 
         // Start in-proc master
         if (!master_.Start(InProcMasterConfigBuilder().build())) return false;
@@ -207,7 +223,71 @@ class DummyClientGetBufferTest : public ::testing::Test {
     std::optional<std::string> saved_hot_cache_env_;
     std::optional<std::string> saved_hot_block_env_;
     std::optional<std::string> saved_hot_shm_env_;
+    std::optional<std::string> saved_hot_admission_env_;
 };
+
+TEST_F(DummyClientGetBufferTest, SharedHotCacheCoalescesConcurrentConsumers) {
+    ASSERT_TRUE(SetupStack(true)) << "Failed to bring up real+dummy stack";
+
+    auto producer = RealClient::create();
+    const std::string producer_ipc =
+        "@dummy_test_producer_" + std::to_string(getpid()) + ".sock";
+    ASSERT_EQ(
+        producer->setup_real("localhost:17816", "P2PHANDSHAKE", kSegmentSize,
+                             kLocalBufSize, FLAGS_protocol, "",
+                             master_.master_address(), nullptr, producer_ipc),
+        0);
+
+    auto second_dummy = std::make_shared<DummyClient>();
+    const std::string rpc_addr = "127.0.0.1:" + std::to_string(rpc_port_);
+    ASSERT_EQ(second_dummy->setup_dummy(kPoolSize, kLocalBufSize, rpc_addr,
+                                        ipc_path_),
+              0);
+
+    const std::string key = "shared_hot_cache_singleflight";
+    const std::string data(kPayloadSize, static_cast<char>(0x5a));
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(producer->put(
+                  key, std::span<const char>(data.data(), data.size()), config),
+              0);
+
+    std::shared_ptr<BufferHandle> first;
+    std::shared_ptr<BufferHandle> second;
+    bool first_loaded = false;
+    bool second_loaded = false;
+    std::thread first_thread([&] {
+        first = dummy_client_->get_shared_buffer(key, 10'000, &first_loaded);
+    });
+    std::thread second_thread([&] {
+        second = second_dummy->get_shared_buffer(key, 10'000, &second_loaded);
+    });
+    first_thread.join();
+    second_thread.join();
+
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_NE(first_loaded, second_loaded);
+    EXPECT_TRUE(dummy_client_->is_hot_cache_ptr(first->ptr()));
+    EXPECT_TRUE(second_dummy->is_hot_cache_ptr(second->ptr()));
+    ASSERT_EQ(first->size(), data.size());
+    ASSERT_EQ(second->size(), data.size());
+    EXPECT_TRUE(std::equal(
+        static_cast<const char *>(first->ptr()),
+        static_cast<const char *>(first->ptr()) + first->size(), data.begin()));
+    EXPECT_TRUE(
+        std::equal(static_cast<const char *>(second->ptr()),
+                   static_cast<const char *>(second->ptr()) + second->size(),
+                   data.begin()));
+
+    first.reset();
+    second.reset();
+    EXPECT_EQ(producer->remove(key, true), 0);
+    second_dummy->tearDownAll();
+    second_dummy.reset();
+    producer->tearDownAll();
+    producer.reset();
+}
 // ---- Regression: a stable hot-cache entry must be invalidated by remove ----
 TEST_F(DummyClientGetBufferTest,
        StableHotCacheEntryShouldBeInvalidatedByRemove) {

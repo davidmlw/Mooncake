@@ -86,6 +86,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
     server.register_handler<&RealClient::acquire_hot_cache>(&real_client);
+    server.register_handler<&RealClient::acquire_shared_hot_cache>(
+        &real_client);
     server.register_handler<&RealClient::release_hot_cache>(&real_client);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&real_client);
     server.register_handler<&RealClient::batch_release_hot_cache>(&real_client);

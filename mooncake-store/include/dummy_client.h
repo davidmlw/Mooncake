@@ -118,6 +118,10 @@ class DummyClient : public PyClient {
         const ReplicateConfig &config = ReplicateConfig{}) override;
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
+    std::shared_ptr<BufferHandle> get_shared_buffer(
+        const std::string &key, uint64_t timeout_ms,
+        bool *owner_load_performed = nullptr);
+
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 

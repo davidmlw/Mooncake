@@ -977,6 +977,38 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
     return std::make_shared<BufferHandle>(local_ptr, size, std::move(release));
 }
 
+std::shared_ptr<BufferHandle> DummyClient::get_shared_buffer(
+    const std::string& key, uint64_t timeout_ms, bool* owner_load_performed) {
+    if (!hot_cache_base_) {
+        return nullptr;
+    }
+
+    auto result =
+        invoke_rpc<&RealClient::acquire_shared_hot_cache,
+                   std::tuple<uint64_t, size_t, bool>>(key, timeout_ms);
+    if (!result) {
+        return nullptr;
+    }
+
+    auto [offset, size, loaded] = result.value();
+    if (offset > hot_cache_size_ || size > hot_cache_size_ - offset) {
+        (void)invoke_rpc<&RealClient::release_hot_cache, void>(key);
+        LOG(ERROR) << "Shared hot cache offset out of bounds: offset=" << offset
+                   << " size=" << size << " cache_size=" << hot_cache_size_;
+        return nullptr;
+    }
+    if (owner_load_performed) {
+        *owner_load_performed = loaded;
+    }
+
+    void* local_ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
+    std::string key_copy = key;
+    auto release = [this, key_copy]() {
+        (void)invoke_rpc<&RealClient::release_hot_cache, void>(key_copy);
+    };
+    return std::make_shared<BufferHandle>(local_ptr, size, std::move(release));
+}
+
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     const std::vector<std::string>& keys) {
     const auto start_time = std::chrono::steady_clock::now();

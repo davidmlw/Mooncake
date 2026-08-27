@@ -14,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include "real_client.h"
@@ -2954,6 +2955,116 @@ RealClient::acquire_hot_cache(const std::string &key) {
     }
 
     return std::make_tuple(static_cast<uint64_t>(offset), blk->size);
+}
+
+tl::expected<std::tuple<uint64_t, size_t, bool>, ErrorCode>
+RealClient::acquire_shared_hot_cache(const std::string &key,
+                                     uint64_t timeout_ms) {
+    constexpr uint64_t kMaxTimeoutMs = 60'000;
+    if (key.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+    if (timeout_ms == 0 || timeout_ms > kMaxTimeoutMs || !client_ ||
+        !client_->IsHotCacheEnabled()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto hot_cache = client_->GetHotCache();
+    const char *threshold =
+        std::getenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD");
+    if (!hot_cache || !hot_cache->IsShm() || threshold == nullptr ||
+        std::string_view(threshold) != "1" ||
+        client_->GetLocalHotCacheAdmissionThreshold() != 1) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto hit = acquire_hot_cache(key);
+    if (hit) {
+        auto [offset, size] = hit.value();
+        return std::make_tuple(offset, size, false);
+    }
+    if (hit.error() != ErrorCode::OBJECT_NOT_FOUND) {
+        return tl::make_unexpected(hit.error());
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    std::shared_ptr<SharedHotCacheLoad> load;
+    bool leader = false;
+    {
+        std::lock_guard<std::mutex> lock(shared_hot_cache_loads_mutex_);
+        auto [it, inserted] = shared_hot_cache_loads_.try_emplace(key);
+        if (inserted) {
+            it->second = std::make_shared<SharedHotCacheLoad>();
+            leader = true;
+        }
+        load = it->second;
+    }
+
+    if (!leader) {
+        std::unique_lock<std::mutex> lock(load->mutex);
+        if (!load->cv.wait_until(lock, deadline, [&] { return load->done; })) {
+            return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+        }
+        const ErrorCode result = load->result;
+        lock.unlock();
+        if (result != ErrorCode::OK) {
+            return tl::make_unexpected(result);
+        }
+        auto follower_hit = acquire_hot_cache(key);
+        if (!follower_hit) {
+            return tl::make_unexpected(follower_hit.error());
+        }
+        auto [offset, size] = follower_hit.value();
+        return std::make_tuple(offset, size, false);
+    }
+
+    auto finish = [&](ErrorCode result) {
+        {
+            std::lock_guard<std::mutex> lock(load->mutex);
+            load->result = result;
+            load->done = true;
+        }
+        load->cv.notify_all();
+        std::lock_guard<std::mutex> lock(shared_hot_cache_loads_mutex_);
+        auto it = shared_hot_cache_loads_.find(key);
+        if (it != shared_hot_cache_loads_.end() && it->second == load) {
+            shared_hot_cache_loads_.erase(it);
+        }
+    };
+
+    const int64_t object_size = getSize(key);
+    if (object_size <= 0) {
+        finish(ErrorCode::OBJECT_NOT_FOUND);
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    if (static_cast<uint64_t>(object_size) > hot_cache->GetBlockSize()) {
+        finish(ErrorCode::BUFFER_OVERFLOW);
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+
+    auto owner_buffer = get_buffer(key);
+    if (!owner_buffer) {
+        finish(ErrorCode::OBJECT_NOT_FOUND);
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto published = acquire_hot_cache(key);
+        if (published) {
+            auto [offset, size] = published.value();
+            finish(ErrorCode::OK);
+            return std::make_tuple(offset, size, true);
+        }
+        if (published.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            finish(published.error());
+            return tl::make_unexpected(published.error());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    finish(ErrorCode::RPC_TIMEOUT);
+    return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
 }
 
 tl::expected<void, ErrorCode> RealClient::release_hot_cache(
