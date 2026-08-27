@@ -2345,6 +2345,28 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("timeout_ms") = 30'000,
             py::return_value_policy::take_ownership)
         .def(
+            "acquire_shared_buffer",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uint64_t timeout_ms) {
+                auto dummy =
+                    std::dynamic_pointer_cast<DummyClient>(self.store_);
+                if (!dummy) {
+                    throw std::runtime_error(
+                        "acquire_shared_buffer requires setup_dummy");
+                }
+                bool owner_load_performed = false;
+                std::shared_ptr<BufferHandle> handle;
+                {
+                    py::gil_scoped_release release;
+                    handle = dummy->get_shared_buffer(key, timeout_ms,
+                                                      &owner_load_performed);
+                }
+                return py::make_tuple(std::move(handle), owner_load_performed);
+            },
+            py::arg("key"), py::arg("timeout_ms") = 30'000,
+            "Acquire a node-shared buffer and report whether this caller "
+            "performed the owner-side load")
+        .def(
             "batch_get_buffer",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
