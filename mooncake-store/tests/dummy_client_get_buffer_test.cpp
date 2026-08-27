@@ -47,6 +47,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::acquire_shared_hot_cache>(&rc);
+    server.register_handler<&RealClient::release_shared_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_release_hot_cache>(&rc);
@@ -252,6 +253,11 @@ TEST_F(DummyClientGetBufferTest, SharedHotCacheCoalescesConcurrentConsumers) {
                   key, std::span<const char>(data.data(), data.size()), config),
               0);
 
+    auto unknown_client =
+        real_client_->acquire_shared_hot_cache(key, 10'000, generate_uuid());
+    ASSERT_FALSE(unknown_client.has_value());
+    EXPECT_EQ(unknown_client.error(), ErrorCode::ILLEGAL_CLIENT);
+
     std::shared_ptr<BufferHandle> first;
     std::shared_ptr<BufferHandle> second;
     bool first_loaded = false;
@@ -281,9 +287,11 @@ TEST_F(DummyClientGetBufferTest, SharedHotCacheCoalescesConcurrentConsumers) {
                    data.begin()));
 
     first.reset();
+    // Simulate a lost release RPC: unmapping the exact DummyClient must reclaim
+    // its server-side hot-cache reference before the local handle disappears.
+    EXPECT_EQ(second_dummy->tearDownAll(), 0);
     second.reset();
     EXPECT_EQ(producer->remove(key, true), 0);
-    second_dummy->tearDownAll();
     second_dummy.reset();
     producer->tearDownAll();
     producer.reset();

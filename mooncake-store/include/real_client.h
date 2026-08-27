@@ -411,7 +411,12 @@ class RealClient : public PyClient {
     // acquire a reference to the published entry. The bool is true only for
     // the caller that performed the owner-side load.
     tl::expected<std::tuple<uint64_t, size_t, bool>, ErrorCode>
-    acquire_shared_hot_cache(const std::string &key, uint64_t timeout_ms);
+    acquire_shared_hot_cache(const std::string &key, uint64_t timeout_ms,
+                             const UUID &client_id);
+
+    // Release a shared hot-cache reference owned by an exact dummy client.
+    tl::expected<void, ErrorCode> release_shared_hot_cache(
+        const std::string &key, const UUID &client_id);
 
     // Hot cache release: decrements ref_count after dummy is done reading.
     tl::expected<void, ErrorCode> release_hot_cache(const std::string &key);
@@ -974,7 +979,12 @@ class RealClient : public PyClient {
         // Buffers held by dummy via acquire_buffer; keyed by dummy address
         std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
             active_handles;
+        // Hot-cache references acquired through get_shared_buffer. Keeping
+        // these in the client context lets normal unmap and heartbeat expiry
+        // recover references after a lost release RPC or consumer death.
+        std::unordered_map<std::string, size_t> active_shared_hot_cache_refs;
     };
+    void release_shared_hot_cache_refs(ShmContext &context);
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 

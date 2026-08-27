@@ -2460,6 +2460,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     }
 
     auto &context = it->second;
+    release_shared_hot_cache_refs(context);
     context.client_buffer_allocator.reset();
 
     for (auto &shm : context.mapped_shms) {
@@ -2685,6 +2686,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     }
 
     auto &context = it->second;
+    release_shared_hot_cache_refs(context);
     context.client_buffer_allocator.reset();
 
     // Move regions out before cleanup so failure paths cannot erase the map
@@ -2959,7 +2961,8 @@ RealClient::acquire_hot_cache(const std::string &key) {
 
 tl::expected<std::tuple<uint64_t, size_t, bool>, ErrorCode>
 RealClient::acquire_shared_hot_cache(const std::string &key,
-                                     uint64_t timeout_ms) {
+                                     uint64_t timeout_ms,
+                                     const UUID &client_id) {
     constexpr uint64_t kMaxTimeoutMs = 60'000;
     if (key.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -2967,6 +2970,12 @@ RealClient::acquire_shared_hot_cache(const std::string &key,
     if (timeout_ms == 0 || timeout_ms > kMaxTimeoutMs || !client_ ||
         !client_->IsHotCacheEnabled()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+        }
     }
 
     auto hot_cache = client_->GetHotCache();
@@ -2978,10 +2987,23 @@ RealClient::acquire_shared_hot_cache(const std::string &key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    auto register_ref = [&](uint64_t offset, size_t size, bool loaded)
+        -> tl::expected<std::tuple<uint64_t, size_t, bool>, ErrorCode> {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto it = shm_contexts_.find(client_id);
+        if (it == shm_contexts_.end()) {
+            lock.unlock();
+            hot_cache->ReleaseHotKey(key);
+            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+        }
+        ++it->second.active_shared_hot_cache_refs[key];
+        return std::make_tuple(offset, size, loaded);
+    };
+
     auto hit = acquire_hot_cache(key);
     if (hit) {
         auto [offset, size] = hit.value();
-        return std::make_tuple(offset, size, false);
+        return register_ref(offset, size, false);
     }
     if (hit.error() != ErrorCode::OBJECT_NOT_FOUND) {
         return tl::make_unexpected(hit.error());
@@ -3016,7 +3038,7 @@ RealClient::acquire_shared_hot_cache(const std::string &key,
             return tl::make_unexpected(follower_hit.error());
         }
         auto [offset, size] = follower_hit.value();
-        return std::make_tuple(offset, size, false);
+        return register_ref(offset, size, false);
     }
 
     auto finish = [&](ErrorCode result) {
@@ -3033,38 +3055,76 @@ RealClient::acquire_shared_hot_cache(const std::string &key,
         }
     };
 
-    const int64_t object_size = getSize(key);
-    if (object_size <= 0) {
-        finish(ErrorCode::OBJECT_NOT_FOUND);
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    if (static_cast<uint64_t>(object_size) > hot_cache->GetBlockSize()) {
-        finish(ErrorCode::BUFFER_OVERFLOW);
-        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
-    }
-
-    auto owner_buffer = get_buffer(key);
-    if (!owner_buffer) {
-        finish(ErrorCode::OBJECT_NOT_FOUND);
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto published = acquire_hot_cache(key);
-        if (published) {
-            auto [offset, size] = published.value();
-            finish(ErrorCode::OK);
-            return std::make_tuple(offset, size, true);
+    try {
+        const int64_t object_size = getSize(key);
+        if (object_size <= 0) {
+            finish(ErrorCode::OBJECT_NOT_FOUND);
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        if (published.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            finish(published.error());
-            return tl::make_unexpected(published.error());
+        if (static_cast<uint64_t>(object_size) > hot_cache->GetBlockSize()) {
+            finish(ErrorCode::BUFFER_OVERFLOW);
+            return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+        auto owner_buffer = get_buffer(key);
+        if (!owner_buffer) {
+            finish(ErrorCode::OBJECT_NOT_FOUND);
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto published = acquire_hot_cache(key);
+            if (published) {
+                auto [offset, size] = published.value();
+                finish(ErrorCode::OK);
+                return register_ref(offset, size, true);
+            }
+            if (published.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                finish(published.error());
+                return tl::make_unexpected(published.error());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Shared hot-cache owner load failed for key '" << key
+                   << "': " << error.what();
+        finish(ErrorCode::INTERNAL_ERROR);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    } catch (...) {
+        LOG(ERROR) << "Shared hot-cache owner load failed for key '" << key
+                   << "' with an unknown exception";
+        finish(ErrorCode::INTERNAL_ERROR);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     finish(ErrorCode::RPC_TIMEOUT);
     return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+}
+
+tl::expected<void, ErrorCode> RealClient::release_shared_hot_cache(
+    const std::string &key, const UUID &client_id) {
+    if (!client_ || !client_->IsHotCacheEnabled()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto context = shm_contexts_.find(client_id);
+        if (context == shm_contexts_.end()) {
+            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+        }
+        auto ref = context->second.active_shared_hot_cache_refs.find(key);
+        if (ref == context->second.active_shared_hot_cache_refs.end() ||
+            ref->second == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (--ref->second == 0) {
+            context->second.active_shared_hot_cache_refs.erase(ref);
+        }
+    }
+
+    client_->GetHotCache()->ReleaseHotKey(key);
+    return {};
 }
 
 tl::expected<void, ErrorCode> RealClient::release_hot_cache(
@@ -3075,6 +3135,18 @@ tl::expected<void, ErrorCode> RealClient::release_hot_cache(
 
     client_->GetHotCache()->ReleaseHotKey(key);
     return {};
+}
+
+void RealClient::release_shared_hot_cache_refs(ShmContext &context) {
+    if (client_ && client_->IsHotCacheEnabled()) {
+        auto hot_cache = client_->GetHotCache();
+        for (const auto &[key, count] : context.active_shared_hot_cache_refs) {
+            for (size_t i = 0; i < count; ++i) {
+                hot_cache->ReleaseHotKey(key);
+            }
+        }
+    }
+    context.active_shared_hot_cache_refs.clear();
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
