@@ -84,6 +84,59 @@ fn push_cmake_cache_library_dirs(search_dirs: &mut Vec<PathBuf>, build_dir: &Pat
     }
 }
 
+fn push_selected_cmake_library_dir(
+    search_dirs: &mut Vec<PathBuf>,
+    build_dir: &PathBuf,
+    cache_key: &str,
+) {
+    let cache_path = build_dir.join("CMakeCache.txt");
+    let Ok(cache) = fs::read_to_string(&cache_path) else {
+        return;
+    };
+    let mut selected = None;
+
+    for line in cache.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some((name, kind)) = key.split_once(':') else {
+            continue;
+        };
+        if name != cache_key {
+            continue;
+        }
+        assert_eq!(
+            kind,
+            "FILEPATH",
+            "{cache_key} in {} must be a FILEPATH entry",
+            cache_path.display()
+        );
+        assert!(
+            selected.is_none(),
+            "duplicate {cache_key} entry in {}",
+            cache_path.display()
+        );
+        selected = Some(value);
+    }
+
+    let Some(value) = selected else {
+        return;
+    };
+    if value.is_empty() || value.ends_with("-NOTFOUND") {
+        return;
+    }
+    let library = PathBuf::from(value);
+    assert!(
+        library.is_file(),
+        "selected {cache_key} library is not a file: {}",
+        library.display()
+    );
+    let parent = library
+        .parent()
+        .expect("selected CMake library must have a parent directory");
+    push_existing_dir(search_dirs, parent.to_path_buf());
+}
+
 fn has_library(search_dirs: &[PathBuf], candidates: &[&str]) -> bool {
     search_dirs.iter().any(|dir| {
         candidates.iter().any(|candidate| {
@@ -94,6 +147,18 @@ fn has_library(search_dirs: &[PathBuf], candidates: &[&str]) -> bool {
         })
     })
 }
+
+const OPTIONAL_NATIVE_LIBRARIES: &[(&str, &[&str])] = &[
+    ("etcd_wrapper", &["etcd_wrapper"]),
+    ("hiredis", &["hiredis"]),
+    ("curl", &["curl"]),
+    ("cuda", &["cuda"]),
+    ("cudart", &["cudart"]),
+    ("nccl", &["nccl"]),
+    ("mlx5", &["mlx5"]),
+    ("uring", &["uring"]),
+    ("zmq", &["zmq"]),
+];
 
 fn emit_link_searches(search_dirs: &[PathBuf]) {
     for dir in search_dirs {
@@ -224,11 +289,7 @@ fn main() {
     let cuda_home = env::var("CUDA_HOME")
         .or_else(|_| env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    println!(
-        "cargo:rustc-link-search=native={}/targets/x86_64-linux/lib",
-        cuda_home
-    );
-
+    let cuda_lib_dir = PathBuf::from(cuda_home).join("targets/x86_64-linux/lib");
     // cachelib_memory_allocator is a static library built alongside mooncake_store.
     println!(
         "cargo:rustc-link-search=native={}",
@@ -243,6 +304,15 @@ fn main() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let mut search_dirs = Vec::new();
+    let selected_build_dir = env::var("MOONCAKE_BUILD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| build_dir.clone());
+    // NCCL 2.30 device/window symbols are not present in older system NCCL
+    // installations. Keep the library selected by this Mooncake configure
+    // ahead of generic system search paths so `-lnccl` resolves consistently
+    // with the headers and static transfer_engine archive.
+    push_selected_cmake_library_dir(&mut search_dirs, &selected_build_dir, "NCCL_DEVICE_LIBRARY");
+    push_existing_dir(&mut search_dirs, cuda_lib_dir);
 
     let explicit_lib_dir = env::var("MOONCAKE_STORE_LIB_DIR").ok().map(PathBuf::from);
     if let Some(dir) = explicit_lib_dir.clone() {
@@ -355,16 +425,7 @@ fn main() {
         println!("cargo:rustc-link-lib={library}");
     }
 
-    for (link_name, candidates) in [
-        ("etcd_wrapper", &["etcd_wrapper"] as &[&str]),
-        ("hiredis", &["hiredis"]),
-        ("curl", &["curl"]),
-        ("cuda", &["cuda"]),
-        ("cudart", &["cudart"]),
-        ("mlx5", &["mlx5"]), // IBGDA device transport (mlx5 DevX) pulled into transfer_engine, CUDA-only
-        ("uring", &["uring"]),
-        ("zmq", &["zmq"]),
-    ] {
+    for &(link_name, candidates) in OPTIONAL_NATIVE_LIBRARIES {
         if has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");
         }
@@ -388,6 +449,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=CXX");
     println!("cargo:rerun-if-env-changed=MOONCAKE_LINK_ASAN");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
     let bindings = bindgen::Builder::default()
         .header(&header)
@@ -400,4 +463,54 @@ fn main() {
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write Mooncake Store bindings");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        has_library, push_cmake_cache_library_dirs, push_existing_dir,
+        push_selected_cmake_library_dir,
+    };
+    use std::{fs, path::PathBuf};
+
+    #[test]
+    fn configured_cuda_and_nccl_libraries_are_detected() {
+        let root = std::env::temp_dir().join(format!(
+            "mooncake-build-link-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let build = root.join("build");
+        let nccl = root.join("selected-nccl/lib");
+        let system = root.join("system/lib");
+        let cuda = root.join("cuda/lib");
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(&nccl).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::create_dir_all(&cuda).unwrap();
+        fs::write(nccl.join("libnccl.so"), []).unwrap();
+        fs::write(system.join("libnccl.so"), []).unwrap();
+        fs::write(system.join("libibverbs.so"), []).unwrap();
+        fs::write(cuda.join("libcudart.so"), []).unwrap();
+        fs::write(
+            build.join("CMakeCache.txt"),
+            format!(
+                "IBVERBS_LIBRARY:FILEPATH={}\nNCCL_DEVICE_LIBRARY:FILEPATH={}\n",
+                system.join("libibverbs.so").display(),
+                nccl.join("libnccl.so").display(),
+            ),
+        )
+        .unwrap();
+
+        let mut search_dirs = Vec::<PathBuf>::new();
+        push_selected_cmake_library_dir(&mut search_dirs, &build, "NCCL_DEVICE_LIBRARY");
+        push_cmake_cache_library_dirs(&mut search_dirs, &build);
+        push_existing_dir(&mut search_dirs, cuda);
+        assert_eq!(search_dirs.first(), Some(&nccl));
+        assert!(has_library(&search_dirs, &["nccl"]));
+        assert!(has_library(&search_dirs, &["cudart"]));
+        assert!(!has_library(&search_dirs, &["not-present"]));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
