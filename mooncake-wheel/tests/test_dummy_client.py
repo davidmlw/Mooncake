@@ -324,6 +324,29 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
 
+    def test_allocate_buffer_put_from_and_release(self):
+        """Publish directly from a writable RAII-managed shared buffer."""
+        import gc
+
+        key = "test_allocate_buffer_put_from"
+        payload = b"direct registered memory"
+        handle = self.store.allocate_buffer(len(payload))
+        self.assertEqual(len(handle), len(payload))
+        view = memoryview(handle)
+        self.assertFalse(view.readonly)
+        view[:] = payload
+        pointer = handle.ptr()
+        self.assertEqual(self.store.register_buffer(pointer, len(payload)), 0)
+        self.assertEqual(self.store.upsert_from(key, pointer, len(payload)), 0)
+        self.assertEqual(self.store.unregister_buffer(pointer), 0)
+        view.release()
+        handle = None
+        gc.collect()
+
+        self.assertEqual(self.store.get(key), payload)
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.remove(key), 0)
+
     def test_batch_is_exist_operations(self):
         """Test batch is_exist operations through the Python interface."""
         batch_size = 20
