@@ -12,6 +12,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "shm_helper.h"
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -2306,6 +2307,36 @@ PYBIND11_MODULE(store, m) {
                  py::gil_scoped_release release;
                  return self.store_->alloc_from_mem_pool(size);
              })
+        .def(
+            "allocate_buffer",
+            [](MooncakeStorePyWrapper &self, size_t size) {
+                if (!self.store_ || size == 0) {
+                    throw std::runtime_error(
+                        "allocate_buffer requires an initialized store and "
+                        "nonzero size");
+                }
+                void *buffer = nullptr;
+                {
+                    py::gil_scoped_release release;
+                    buffer = reinterpret_cast<void *>(
+                        self.store_->alloc_from_mem_pool(size));
+                }
+                if (buffer == nullptr) {
+                    throw std::runtime_error("allocate_buffer failed");
+                }
+                auto release_buffer = [buffer]() {
+                    if (ShmHelper::getInstance()->free(buffer) != 0) {
+                        LOG(ERROR) << "Failed to release allocated Python "
+                                      "buffer at "
+                                   << buffer;
+                    }
+                };
+                return std::make_shared<BufferHandle>(
+                    buffer, size, std::move(release_buffer));
+            },
+            py::arg("size"),
+            "Allocate a writable, RAII-managed shared buffer for direct "
+            "registered-memory operations")
         .def("get", &mooncake::MooncakeStorePyWrapper::get)
         .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
         .def("get_offload_rpc_read_count",
